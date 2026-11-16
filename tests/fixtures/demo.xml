@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A protocol written for this crate's tests. It is not a real protocol:
+     it exists to use every argument type and naming case the scanner
+     handles. -->
+<protocol name="demo">
+  <copyright>None of this text may reach the generated module.</copyright>
+
+  <interface name="demo_hub" version="3">
+    <description summary="the entry point">Nor may this.</description>
+
+    <enum name="error">
+      <entry name="bad_thing" value="0" summary="a thing was bad"/>
+      <entry name="worse_thing" value="1"/>
+    </enum>
+
+    <enum name="turn" bitfield="true">
+      <entry name="none" value="0"/>
+      <entry name="90" value="0x1"/>
+      <entry name="flipped_180" value="0x2" since="2"/>
+    </enum>
+
+    <request name="make_item">
+      <arg name="id" type="new_id" interface="demo_item"/>
+      <arg name="label" type="string"/>
+      <arg name="parent" type="object" interface="demo_item" allow-null="true"/>
+    </request>
+
+    <request name="attach">
+      <arg name="fd" type="fd"/>
+      <arg name="size" type="int"/>
+      <arg name="scale" type="fixed"/>
+      <arg name="payload" type="array"/>
+      <arg name="note" type="string" allow-null="true"/>
+      <arg name="anything" type="object"/>
+    </request>
+
+    <request name="bind">
+      <arg name="name" type="uint"/>
+      <arg name="id" type="new_id"/>
+    </request>
+
+    <request name="move" since="2">
+      <arg name="type" type="uint" enum="turn"/>
+      <arg name="conn" type="int"/>
+    </request>
+
+    <request name="destroy" type="destructor" since="3"/>
+
+    <event name="item_added">
+      <arg name="item" type="new_id" interface="demo_item"/>
+      <arg name="label" type="string"/>
+    </event>
+
+    <event name="status" since="2">
+      <arg name="fd" type="fd"/>
+      <arg name="amount" type="int"/>
+      <arg name="scale" type="fixed"/>
+      <arg name="payload" type="array"/>
+      <arg name="note" type="string" allow-null="true"/>
+      <arg name="item" type="object" interface="demo_item" allow-null="true"/>
+      <arg name="anything" type="object"/>
+    </event>
+
+    <event name="quiet"/>
+  </interface>
+
+  <interface name="demo_item" version="1">
+    <request name="rename">
+      <arg name="label" type="string"/>
+    </request>
+    <request name="destroy" type="destructor"/>
+    <event name="self">
+      <arg name="serial" type="uint"/>
+    </event>
+    <event name="gone" type="destructor"/>
+  </interface>
+
+  <interface name="demo_marker" version="1"/>
+</protocol>
