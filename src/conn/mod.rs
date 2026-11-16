@@ -89,6 +89,7 @@ impl Objects {
         id: u32,
         interface: &'static Interface,
         version: u32,
+        dead: bool,
     ) -> Result<(), WireError> {
         let index = id
             .checked_sub(SERVER_ID_BASE)
@@ -96,7 +97,7 @@ impl Objects {
         let slot = Some(Slot {
             interface,
             version,
-            dead: false,
+            dead,
         });
         match index.cmp(&self.server.len()) {
             std::cmp::Ordering::Less => self.server[index] = slot,
@@ -136,6 +137,8 @@ enum Broken {
         message: String,
     },
     Wire(WireError),
+    /// The socket failed in a way that leaves the stream unusable.
+    Io(io::ErrorKind, String),
     Closed,
 }
 
@@ -154,6 +157,7 @@ impl Broken {
                 message: message.clone(),
             },
             Broken::Wire(e) => Error::Wire(e.clone()),
+            Broken::Io(kind, text) => Error::Io(io::Error::new(*kind, text.clone())),
             Broken::Closed => Error::Closed,
         }
     }
@@ -603,7 +607,9 @@ impl Connection {
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
             Err(e) if e.kind() == io::ErrorKind::ConnectionReset => self.fail(Broken::Closed),
-            Err(e) => Err(Error::Io(e)),
+            // Anything else (descriptors lost to a full table among them)
+            // leaves bytes and descriptors out of step for good.
+            Err(e) => self.fail(Broken::Io(e.kind(), e.to_string())),
         }
     }
 
@@ -639,18 +645,24 @@ impl Connection {
             let fds: VecDeque<OwnedFd> = self.in_fds.drain(..nfds).collect();
             let body = body.to_vec();
             self.in_pos += header.len;
-            if slot.dead {
-                // Its descriptors close here; objects it would have created
-                // are never known, and their events are dropped in turn.
-                continue;
-            }
+            // An object made by an event to a destroyed object is recorded
+            // as destroyed too: its id keeps its place in the compositor's
+            // sequence, and its own events are dropped with their
+            // descriptors closed.
             for (id, interface) in created {
                 let Some(interface) = interface else {
                     return self.fail(Broken::Wire(WireError::BadNewId(id)));
                 };
-                if let Err(e) = self.objects.insert_server(id, interface, slot.version) {
+                let made = self
+                    .objects
+                    .insert_server(id, interface, slot.version, slot.dead);
+                if let Err(e) = made {
                     return self.fail(Broken::Wire(e));
                 }
+            }
+            if slot.dead {
+                // The event's descriptors close here.
+                continue;
             }
             let event = Event {
                 object: header.object,
@@ -878,8 +890,19 @@ impl Request<'_> {
     }
 
     /// An untyped new-id argument, as `wl_registry.bind` has: the
-    /// interface's name, the version to bind, and the new id.
+    /// interface's name, the version to bind, and the new id. The version
+    /// must be one the interface's tables describe (1 to its `version`);
+    /// bind the lower of that and what the compositor advertises.
     pub fn new_id_bound(&mut self, interface: &'static Interface, version: u32) -> u32 {
+        if version == 0 || version > interface.version {
+            // Events of a newer version would not be in the tables, and one
+            // arriving would end the connection.
+            self.error.get_or_insert(Error::UnsupportedVersion {
+                interface: interface.name,
+                version,
+                supported: interface.version,
+            });
+        }
         let id = self.create(interface, version);
         self.string(Some(interface.name));
         self.uint(version);

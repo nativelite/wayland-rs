@@ -38,6 +38,16 @@ pub enum Error {
     /// No object ids are left, or a request creates more objects than this
     /// crate supports in one message.
     TooManyObjects,
+    /// A bind asked for a version of an interface that this crate's tables
+    /// do not describe.
+    UnsupportedVersion {
+        /// The interface.
+        interface: &'static str,
+        /// The version asked for.
+        version: u32,
+        /// The highest version the tables describe.
+        supported: u32,
+    },
 }
 
 impl fmt::Display for Error {
@@ -60,6 +70,14 @@ impl fmt::Display for Error {
                 write!(f, "event of {found} decoded as {expected}")
             }
             Error::TooManyObjects => f.write_str("out of wayland object ids"),
+            Error::UnsupportedVersion {
+                interface,
+                version,
+                supported,
+            } => write!(
+                f,
+                "cannot bind {interface} at version {version}: versions 1 to {supported} are known"
+            ),
         }
     }
 }

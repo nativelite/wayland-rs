@@ -88,6 +88,9 @@ and enum values, and none of its descriptive text.
   supported. `wire` and `scan` build anywhere.
 - No check that a request exists at the version an object was bound with; the
   generated `REQ_*_SINCE` / `EVT_*_SINCE` constants say when each arrived.
+- A bind is refused (`Error::UnsupportedVersion`) above the version the
+  generated tables describe: bind the lower of `T::interface().version` and
+  what the compositor advertises.
 - Handles are plain ids. Using one after destroying its object is a protocol
   error the compositor reports, as in C.
 - With `WAYLAND_SOCKET` set, `Connection::connect` removes the variable from

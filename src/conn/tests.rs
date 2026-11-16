@@ -9,6 +9,7 @@ use crate::protocol::wayland::{
 };
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::IntoRawFd;
 
 /// The compositor's end of the socket.
 struct Server {
@@ -870,4 +871,105 @@ fn a_listening_socket_is_connected_to_by_path() {
     server.expect(1, 0, &words(&[2]));
     assert!(conn.as_raw_fd() >= 0 && conn.as_fd().as_raw_fd() == conn.as_raw_fd());
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn binding_a_version_the_tables_do_not_describe_is_refused() {
+    let (mut conn, mut server) = pair();
+    let registry = conn.display().get_registry(&mut conn).unwrap();
+    conn.flush().unwrap();
+    server.request().unwrap();
+    let known = WlCompositor::interface().version;
+    for bad in [0, known + 1, u32::MAX] {
+        match registry.bind::<WlCompositor>(&mut conn, 1, bad) {
+            Err(Error::UnsupportedVersion {
+                interface,
+                version,
+                supported,
+            }) => assert_eq!(
+                (interface, version, supported),
+                ("wl_compositor", bad, known)
+            ),
+            other => panic!("{bad}: {other:?}"),
+        }
+    }
+    conn.flush().unwrap();
+    assert_eq!(server.request(), None, "nothing was sent");
+    let compositor: WlCompositor = registry.bind(&mut conn, 1, known).unwrap();
+    assert_eq!(compositor.id(), 3, "and no id was used up");
+}
+
+#[test]
+fn an_object_made_for_a_destroyed_object_keeps_its_place_and_stays_silent() {
+    let (mut conn, server) = pair();
+    let registry = conn.display().get_registry(&mut conn).unwrap();
+    let manager: WlDataDeviceManager = registry.bind(&mut conn, 1, 3).unwrap();
+    let seat: WlSeat = registry.bind(&mut conn, 2, 5).unwrap();
+    let old = manager.get_data_device(&mut conn, seat).unwrap();
+    let device = manager.get_data_device(&mut conn, seat).unwrap();
+    old.release(&mut conn).unwrap();
+
+    // The compositor had not seen the release yet: it makes an offer for
+    // the old device, describes it, then makes one for the live device.
+    server.send(&message(old.id(), 0, |b| b.uint(0xff00_0000)));
+    server.send(&message(0xff00_0000, 0, |b| {
+        b.string(Some("text/plain")).unwrap()
+    }));
+    server.send(&message(device.id(), 0, |b| b.uint(0xff00_0001)));
+    let events = drain(&mut conn).unwrap();
+    assert_eq!(events.len(), 1, "only the live device's offer");
+    assert!(events[0].is_for(&device));
+    assert!(conn.object(0xff00_0000).is_none());
+    assert_eq!(conn.object(0xff00_0001).unwrap().0.name, "wl_data_offer");
+}
+
+#[test]
+fn unparsed_bytes_survive_the_buffer_being_compacted() {
+    let (mut conn, server) = pair();
+    let registry = conn.display().get_registry(&mut conn).unwrap();
+    // One write per batch: many small ones would fill the socket's buffer
+    // with bookkeeping.
+    let send = |from: u32, to: u32| {
+        let mut bytes = Vec::new();
+        for n in from..to {
+            bytes.extend_from_slice(&global(registry.id(), n, "some_interface_name", 3));
+        }
+        server.send(&bytes);
+    };
+    let expect = |conn: &mut Connection, n: u32| match wl_registry::Event::decode(
+        conn.next_event().unwrap().unwrap(),
+    )
+    .unwrap()
+    {
+        wl_registry::Event::Global { name, .. } => assert_eq!(name, n),
+        other => panic!("{other:?}"),
+    };
+    // 300 events of 36 bytes; parse 200, leaving 3600 bytes behind 7200
+    // already consumed, then read more: the consumed part is dropped.
+    send(0, 300);
+    while conn.read().unwrap() > 0 {}
+    for n in 0..200 {
+        expect(&mut conn, n);
+    }
+    assert!(conn.in_pos >= 4096);
+    send(300, 310);
+    assert!(conn.read().unwrap() > 0);
+    assert_eq!(conn.in_pos, 0);
+    for n in 200..310 {
+        expect(&mut conn, n);
+    }
+    assert!(conn.next_event().unwrap().is_none());
+}
+
+#[test]
+fn a_socket_error_while_reading_ends_the_connection() {
+    // A descriptor that is not a socket: every read fails the same way.
+    let file = file_with("not a socket");
+    let fd = file.as_fd().try_clone_to_owned().unwrap();
+    // SAFETY: an owned, open descriptor; that it is no socket is the test.
+    let stream = unsafe { UnixStream::from_raw_fd(fd.into_raw_fd()) };
+    let mut conn = Connection::from_stream(stream);
+    assert!(matches!(conn.read(), Err(Error::Io(_))));
+    assert!(matches!(conn.next_event(), Err(Error::Io(_))));
+    assert!(matches!(conn.display().sync(&mut conn), Err(Error::Io(_))));
 }
