@@ -9,8 +9,12 @@ libwayland.
   are declared against the C library the standard library already links.
 - **One concern:** speaking the Wayland protocol as a client.
 
-Crate `nativelite-wayland`, library name `wayland`. Version 0.1.0, not yet
-published to crates.io.
+Crate `nativelite-wayland` on crates.io, library name `wayland`:
+
+```toml
+[dependencies]
+wayland = { package = "nativelite-wayland", version = "0.1" }
+```
 
 ## What is in it
 
