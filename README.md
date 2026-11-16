@@ -91,6 +91,9 @@ and enum values, and none of its descriptive text.
 - A bind is refused (`Error::UnsupportedVersion`) above the version the
   generated tables describe: bind the lower of `T::interface().version` and
   what the compositor advertises.
+- No 4096-byte cap on a request. A compositor built on libwayland older than
+  1.23 drops a client that sends a larger message; this crate sends anything
+  the format allows (65532 bytes).
 - Handles are plain ids. Using one after destroying its object is a protocol
   error the compositor reports, as in C.
 - With `WAYLAND_SOCKET` set, `Connection::connect` removes the variable from
@@ -106,8 +109,9 @@ python dev.py check    # dependency guard + cargo fmt --check + cargo test
 python dev.py test     # cargo test
 ```
 
-`check` is the gate before every push. On Windows it covers the wire format
-and the scanner; on Linux it also covers the connection, against a compositor
+`check` is the gate before every push. On Windows the wire format and the
+scanner are all that builds, so `check` there goes on to run itself inside
+WSL (and says so loudly if there is no WSL); on Linux it covers the connection, against a compositor
 played by the tests and, when one is running, against the real one. The live
 test never attaches a buffer, so no window appears; with no compositor it
 prints that it was skipped and passes.

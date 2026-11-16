@@ -28,6 +28,9 @@ struct Slot {
     /// Destroyed by this side, its id not yet released by the compositor:
     /// events still on their way to it are dropped.
     dead: bool,
+    /// The compositor released the id (`delete_id`) while this side still
+    /// held the object: the id is free once this side destroys it too.
+    released: bool,
 }
 
 /// The objects alive on a connection, by id.
@@ -56,6 +59,7 @@ impl Objects {
             interface,
             version,
             dead: false,
+            released: false,
         });
         if let Some(id) = self.free.pop() {
             self.client[id as usize] = slot;
@@ -98,6 +102,7 @@ impl Objects {
             interface,
             version,
             dead,
+            released: false,
         });
         match index.cmp(&self.server.len()) {
             std::cmp::Ordering::Less => self.server[index] = slot,
@@ -107,21 +112,46 @@ impl Objects {
         Ok(())
     }
 
-    /// This side destroyed `id`. A client id stays reserved until the
-    /// compositor releases it; a compositor id is free at once.
+    /// The object `id` is gone for the caller: this side destroyed it, or
+    /// an event that ends it arrived. A client id stays reserved until the
+    /// compositor releases it. A compositor id keeps its entry, marked
+    /// dead, so events still on their way to it are read by their
+    /// signature (their descriptors closed, the objects they make
+    /// recorded) until the compositor uses the id again.
     fn destroyed(&mut self, id: u32) {
         if id >= SERVER_ID_BASE {
-            if let Some(slot) = self.server.get_mut((id - SERVER_ID_BASE) as usize) {
-                *slot = None;
+            if let Some(Some(slot)) = self.server.get_mut((id - SERVER_ID_BASE) as usize) {
+                slot.dead = true;
             }
-        } else if let Some(Some(slot)) = self.client.get_mut(id as usize) {
-            slot.dead = true;
+        } else if id > 1 {
+            let released = match self.client.get_mut(id as usize) {
+                Some(Some(slot)) => {
+                    slot.dead = true;
+                    slot.released
+                }
+                _ => false,
+            };
+            if released {
+                self.unalloc(id);
+            }
         }
     }
 
     /// The compositor released client id `id` (`wl_display.delete_id`).
+    /// The id is free for a new object only once this side has let go of
+    /// the object too; a release for one still alive is remembered.
     fn released(&mut self, id: u32) {
-        if id < SERVER_ID_BASE && id > 1 {
+        if id >= SERVER_ID_BASE || id <= 1 {
+            return;
+        }
+        let dead = match self.client.get_mut(id as usize) {
+            Some(Some(slot)) => {
+                slot.released = true;
+                slot.dead
+            }
+            _ => false,
+        };
+        if dead {
             self.unalloc(id);
         }
     }
@@ -348,6 +378,9 @@ pub struct Connection {
     /// Events parsed while waiting for something else (a roundtrip).
     queue: VecDeque<Event>,
     objects: Objects,
+    /// The stream ended or failed while reading. It becomes `broken` once
+    /// the whole events read before it have been handed out.
+    ended: Option<Broken>,
     broken: Option<Broken>,
 }
 
@@ -460,6 +493,7 @@ impl Connection {
             interface: &wl_display::INTERFACE,
             version: 1,
             dead: false,
+            released: false,
         }));
         Connection {
             stream,
@@ -471,6 +505,7 @@ impl Connection {
             in_fds: VecDeque::new(),
             queue: VecDeque::new(),
             objects,
+            ended: None,
             broken: None,
         }
     }
@@ -589,8 +624,15 @@ impl Connection {
     /// connection's buffer. Returns the number of bytes; 0 means nothing
     /// was waiting. Call it when the descriptor polls readable, then drain
     /// [`next_event`](Self::next_event).
+    ///
+    /// The end of the stream, or a socket error, also reads as 0 here: it
+    /// is reported by `next_event` after the events that arrived before it,
+    /// and by every call from then on.
     pub fn read(&mut self) -> Result<usize, Error> {
         self.check()?;
+        if self.ended.is_some() {
+            return Ok(0);
+        }
         if self.in_pos == self.inbuf.len() {
             self.inbuf.clear();
             self.in_pos = 0;
@@ -600,17 +642,24 @@ impl Connection {
         }
         let mut chunk = [0u8; 4096];
         match sys::recv(self.stream.as_raw_fd(), &mut chunk, &mut self.in_fds) {
-            Ok(0) => self.fail(Broken::Closed),
+            Ok(0) => self.end(Broken::Closed),
             Ok(n) => {
                 self.inbuf.extend_from_slice(&chunk[..n]);
-                Ok(n)
+                return Ok(n);
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
-            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => self.fail(Broken::Closed),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => self.end(Broken::Closed),
             // Anything else (descriptors lost to a full table among them)
             // leaves bytes and descriptors out of step for good.
-            Err(e) => self.fail(Broken::Io(e.kind(), e.to_string())),
+            Err(e) => self.end(Broken::Io(e.kind(), e.to_string())),
         }
+        Ok(0)
+    }
+
+    /// Nothing more will be read. Whole events already in the buffer are
+    /// still handed out; `parse` reports `why` after the last of them.
+    fn end(&mut self, why: Broken) {
+        self.ended = Some(why);
     }
 
     /// The next whole event in the buffer, skipping what is not the
@@ -622,7 +671,14 @@ impl Connection {
             let avail = &self.inbuf[self.in_pos..];
             let header = match wire::header(avail) {
                 Ok(Some(h)) if avail.len() >= h.len => h,
-                Ok(_) => return Ok(None),
+                Ok(_) => {
+                    // No whole event left. If the stream has ended, this
+                    // is where that is reported.
+                    return match self.ended.take() {
+                        Some(why) => self.fail(why),
+                        None => Ok(None),
+                    };
+                }
                 Err(e) => return self.fail(Broken::Wire(e)),
             };
             let body = &avail[wire::HEADER_LEN..header.len];
@@ -663,6 +719,10 @@ impl Connection {
             if slot.dead {
                 // The event's descriptors close here.
                 continue;
+            }
+            if desc.destructor {
+                // The event ends its object (`wl_callback.done`).
+                self.objects.destroyed(header.object);
             }
             let event = Event {
                 object: header.object,
@@ -719,16 +779,21 @@ impl Connection {
                 return Ok(true);
             }
             let flushed = self.try_flush()?;
-            let timeout = match deadline {
-                None => None,
+            // Past the deadline there is still one look at the socket, not
+            // a wait: a zero timeout takes what has already arrived.
+            let (timeout, last) = match deadline {
+                None => (None, false),
                 Some(d) => match d.checked_duration_since(Instant::now()) {
-                    Some(left) if !left.is_zero() => Some(left),
-                    _ => return Ok(false),
+                    Some(left) if !left.is_zero() => (Some(left), false),
+                    _ => (Some(Duration::ZERO), true),
                 },
             };
-            let ready = sys::wait(self.stream.as_raw_fd(), !flushed, timeout)?;
+            let ready = sys::wait(self.stream.as_raw_fd(), !flushed && !last, timeout)?;
             if ready.read {
                 self.read()?;
+            }
+            if last {
+                return if ready.read { done(self) } else { Ok(false) };
             }
         }
     }
@@ -920,6 +985,11 @@ impl Request<'_> {
         let Some(builder) = self.builder.take() else {
             return Err(Error::Wire(WireError::TooLong));
         };
+        // All of a message's descriptors travel with its first byte, and
+        // one write carries at most this many.
+        if self.fds.len() - self.fds_start > sys::MAX_FDS_OUT {
+            return Err(Error::Wire(WireError::TooLong));
+        }
         builder.finish()?;
         self.sent = true;
         if destructor {

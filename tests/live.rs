@@ -158,16 +158,27 @@ fn a_toplevel_reaches_its_first_configure_on_the_real_compositor() {
     pool.destroy(&mut conn).unwrap();
     wm_base.destroy(&mut conn).unwrap();
     conn.roundtrip().unwrap();
-    // None of them is an object any more.
-    for id in [
+    // None of them is an object any more, and the compositor has released
+    // their ids: the next object made takes one of them.
+    let freed = [
         toplevel.id(),
         xdg.id(),
         surface.id(),
         buffer.id(),
         pool.id(),
-    ] {
+        wm_base.id(),
+    ];
+    for id in freed {
         assert!(conn.object(id).is_none());
     }
+    let again: WlSurface = compositor.create_surface(&mut conn).unwrap();
+    assert!(
+        freed.contains(&again.id()),
+        "id {} is not one the compositor released ({freed:?})",
+        again.id()
+    );
+    again.destroy(&mut conn).unwrap();
+    conn.roundtrip().unwrap();
     eprintln!(
         "live: ran against the compositor: bound wl_compositor, wl_shm, xdg_wm_base; \
          configure serial {serial}"

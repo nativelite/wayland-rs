@@ -223,17 +223,24 @@ pub(super) struct Ready {
 /// Waits until `socket` can be read (or written too, with `write`), for at
 /// most `timeout`, forever with `None`. Nothing ready means it timed out.
 pub(super) fn wait(socket: RawFd, write: bool, timeout: Option<Duration>) -> io::Result<Ready> {
-    let ms = match timeout {
-        None => -1,
-        // Round up, so a short timeout does not become a busy loop.
-        Some(d) => i32::try_from((d.as_nanos() + 999_999) / 1_000_000).unwrap_or(i32::MAX),
-    };
+    let deadline = timeout.and_then(|d| std::time::Instant::now().checked_add(d));
     let mut fd = PollFd {
         fd: socket,
         events: POLLIN | if write { POLLOUT } else { 0 },
         revents: 0,
     };
     loop {
+        // Worked out again each time round: a signal that interrupts the
+        // wait does not restart the timeout.
+        let ms = match (timeout, deadline) {
+            (None, _) => -1,
+            (Some(_), None) => i32::MAX,
+            (Some(_), Some(at)) => {
+                let left = at.saturating_duration_since(std::time::Instant::now());
+                // Round up, so a short timeout does not become a busy loop.
+                i32::try_from((left.as_nanos() + 999_999) / 1_000_000).unwrap_or(i32::MAX)
+            }
+        };
         // SAFETY: one pollfd, and the count says one.
         let n = unsafe { poll(&mut fd, 1, ms) };
         if n >= 0 {

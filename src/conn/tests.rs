@@ -488,6 +488,9 @@ fn a_compositor_that_goes_away_is_reported_as_closed() {
         matches!(conn.flush(), Ok(())),
         "nothing to tell from a write alone"
     );
+    // The read says nothing arrived; the next event says why.
+    assert_eq!(conn.read().unwrap(), 0);
+    assert!(matches!(conn.next_event(), Err(Error::Closed)));
     assert!(matches!(conn.read(), Err(Error::Closed)));
 }
 
@@ -969,7 +972,135 @@ fn a_socket_error_while_reading_ends_the_connection() {
     // SAFETY: an owned, open descriptor; that it is no socket is the test.
     let stream = unsafe { UnixStream::from_raw_fd(fd.into_raw_fd()) };
     let mut conn = Connection::from_stream(stream);
-    assert!(matches!(conn.read(), Err(Error::Io(_))));
+    // The read itself says nothing arrived; the failure is the next event.
+    assert_eq!(conn.read().unwrap(), 0);
     assert!(matches!(conn.next_event(), Err(Error::Io(_))));
+    assert!(matches!(conn.read(), Err(Error::Io(_))));
     assert!(matches!(conn.display().sync(&mut conn), Err(Error::Io(_))));
+}
+
+#[test]
+fn events_read_before_the_compositor_hung_up_still_come_out() {
+    let (mut conn, server) = pair();
+    let registry = conn.display().get_registry(&mut conn).unwrap();
+    server.send(&global(registry.id(), 1, "wl_seat", 9));
+    server.send(&message(1, 0, |b| {
+        b.uint(registry.id());
+        b.uint(7);
+        b.string(Some("the reason")).unwrap();
+    }));
+    drop(server);
+    // Read until there is no more, as a loop woken by an edge must: the end
+    // of the stream is not an error until what came before it is handed out.
+    while conn.read().unwrap() > 0 {}
+    assert_eq!(conn.read().unwrap(), 0);
+    assert_eq!(conn.next_event().unwrap().unwrap().name(), "global");
+    match conn.next_event() {
+        Err(Error::Protocol { code, message, .. }) => {
+            assert_eq!((code, message.as_str()), (7, "the reason"))
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // With no error sent, the events come out and then the connection is
+    // closed.
+    let (mut conn, server) = pair();
+    let registry = conn.display().get_registry(&mut conn).unwrap();
+    server.send(&global(registry.id(), 1, "wl_seat", 9));
+    drop(server);
+    while conn.read().unwrap() > 0 {}
+    assert_eq!(conn.next_event().unwrap().unwrap().name(), "global");
+    assert!(matches!(conn.next_event(), Err(Error::Closed)));
+    assert!(matches!(conn.read(), Err(Error::Closed)));
+    assert!(matches!(conn.wait_event(), Err(Error::Closed)));
+}
+
+#[test]
+fn a_zero_timeout_still_takes_what_is_waiting_in_the_socket() {
+    let (mut conn, server) = pair();
+    let registry = conn.display().get_registry(&mut conn).unwrap();
+    server.send(&global(registry.id(), 1, "wl_output", 4));
+    let e = conn.wait_event_timeout(Duration::ZERO).unwrap().unwrap();
+    assert_eq!(e.name(), "global");
+    assert!(conn.wait_event_timeout(Duration::ZERO).unwrap().is_none());
+}
+
+#[test]
+fn a_delete_id_for_a_live_object_does_not_hand_its_id_to_another() {
+    let (mut conn, server) = pair();
+    let registry = conn.display().get_registry(&mut conn).unwrap();
+    let seat: WlSeat = registry.bind(&mut conn, 2, 5).unwrap();
+    // The compositor releases an id this side never destroyed.
+    server.send(&message(1, 1, |b| b.uint(seat.id())));
+    assert!(drain(&mut conn).unwrap().is_empty());
+    let compositor: WlCompositor = registry.bind(&mut conn, 1, 4).unwrap();
+    assert_ne!(compositor.id(), seat.id());
+    assert_eq!(conn.object(seat.id()).unwrap().0.name, "wl_seat");
+    // Once this side lets go of it too, the id is free.
+    seat.release(&mut conn).unwrap();
+    let shm: WlShm = registry.bind(&mut conn, 3, 1).unwrap();
+    assert_eq!(shm.id(), seat.id());
+}
+
+#[test]
+fn an_object_ended_by_its_own_event_is_gone_and_its_id_comes_back() {
+    let (mut conn, server) = pair();
+    let callback = conn.display().sync(&mut conn).unwrap();
+    server.send(&message(callback.id(), 0, |b| b.uint(0)));
+    let events = drain(&mut conn).unwrap();
+    assert_eq!(events[0].name(), "done");
+    assert!(conn.object(callback.id()).is_none(), "done ends a callback");
+    // Not reused before the compositor says so.
+    let second = conn.display().sync(&mut conn).unwrap();
+    assert_ne!(second.id(), callback.id());
+    server.send(&message(1, 1, |b| b.uint(callback.id())));
+    assert!(drain(&mut conn).unwrap().is_empty());
+    assert_eq!(conn.display().sync(&mut conn).unwrap().id(), callback.id());
+}
+
+#[test]
+fn an_event_in_flight_to_a_destroyed_compositor_object_is_dropped_and_its_id_used_again() {
+    let (mut conn, server) = pair();
+    let registry = conn.display().get_registry(&mut conn).unwrap();
+    let manager: WlDataDeviceManager = registry.bind(&mut conn, 1, 3).unwrap();
+    let seat: WlSeat = registry.bind(&mut conn, 2, 5).unwrap();
+    let device = manager.get_data_device(&mut conn, seat).unwrap();
+    let keyboard = seat.get_keyboard(&mut conn).unwrap();
+    server.send(&message(device.id(), 0, |b| b.uint(0xff00_0000)));
+    let offer = match wl_data_device::Event::decode(drain(&mut conn).unwrap().remove(0)).unwrap() {
+        wl_data_device::Event::DataOffer { id } => id,
+        other => panic!("{other:?}"),
+    };
+    offer.destroy(&mut conn).unwrap();
+    assert!(conn.object(offer.id()).is_none());
+    // The compositor had not seen that yet: an event to the offer, then a
+    // keymap with its descriptor. The keymap must get its own descriptor.
+    server.send(&message(offer.id(), 0, |b| {
+        b.string(Some("text/plain")).unwrap()
+    }));
+    let file = file_with("the keymap");
+    server.send_fds(
+        &message(keyboard.id(), 0, |b| {
+            b.uint(1);
+            b.uint(10);
+        }),
+        &[file.as_raw_fd()],
+    );
+    let mut events = drain(&mut conn).unwrap();
+    assert_eq!(events.len(), 1);
+    match wl_keyboard::Event::decode(events.remove(0)).unwrap() {
+        wl_keyboard::Event::Keymap { fd, size, .. } => {
+            assert_eq!(size, 10);
+            let mut text = String::new();
+            let mut f = File::from(fd);
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.read_to_string(&mut text).unwrap();
+            assert_eq!(text, "the keymap");
+        }
+        other => panic!("{other:?}"),
+    }
+    // The compositor uses the id again for a new offer.
+    server.send(&message(device.id(), 0, |b| b.uint(0xff00_0000)));
+    assert_eq!(drain(&mut conn).unwrap().len(), 1);
+    assert_eq!(conn.object(0xff00_0000).unwrap().0.name, "wl_data_offer");
 }

@@ -6,6 +6,9 @@ memory is identical across languages. Here `check` is the zero-dependency guard
 plus `cargo fmt --check` and `cargo test` (unit + integration + doctests):
 
   python dev.py check                 # guard + cargo fmt --check + cargo test
+                                      # (on Windows, then the same inside WSL:
+                                      # the connection only builds on Linux)
+  python dev.py linux                 # just the WSL half, from Windows
   python dev.py test                  # cargo test
   python dev.py build                 # cargo build --release
   python dev.py fmt                   # cargo fmt --check
@@ -13,6 +16,7 @@ plus `cargo fmt --check` and `cargo test` (unit + integration + doctests):
 """
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -42,11 +46,29 @@ def guard() -> int:
     return run(PY, "tools/dep_guard.py")
 
 
+def linux() -> int:
+    """The same gate inside WSL. On Windows the connection and the generated
+    protocols are compiled out, so `check` there is only half the gate."""
+    if sys.platform != "win32":
+        return 0
+    if shutil.which("wsl.exe") is None:
+        print("WARNING: no WSL here, so the connection (src/conn, src/protocol,")
+        print("tests/demo.rs, tests/live.rs) was NOT built or tested. Run the gate on Linux.")
+        return 0
+    drive, rest = ROOT.as_posix().split(":", 1)
+    path = f"/mnt/{drive.lower()}{rest}"
+    script = (
+        f"cd '{path}' && CARGO_TARGET_DIR=$HOME/.cache/nl-target/{ROOT.name} "
+        "python3 dev.py check"
+    )
+    return run("wsl.exe", "--", "bash", "-lc", script)
+
+
 def check() -> int:
-    return guard() or fmt() or test()
+    return guard() or fmt() or test() or linux()
 
 
-COMMANDS = {"test": test, "build": build, "fmt": fmt, "guard": guard, "check": check}
+COMMANDS = {"test": test, "build": build, "fmt": fmt, "guard": guard, "linux": linux, "check": check}
 
 
 def main(argv: list[str]) -> int:
